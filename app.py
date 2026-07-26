@@ -152,22 +152,18 @@ def make_call_id(dossier_id, content_hash):
 
 
 def validate_propose_request(body):
-    required = ["profile", "operation", "evaluationId", "receiptVerifier", "dossiers"]
-    for f in required:
-        if f not in body:
-            return f"Missing required field: {f}"
-    if body.get("operation") != "propose":
-        return "operation must be 'propose'"
-    if not isinstance(body.get("dossiers"), list) or len(body["dossiers"]) == 0:
-        return "dossiers must be a non-empty array"
+    if "dossiers" not in body or not isinstance(body["dossiers"], list):
+        return "dossiers must be an array"
+    rv = body.get("receiptVerifier")
+    if not isinstance(rv, dict):
+        return "receiptVerifier is required"
+    if not isinstance(rv.get("publicJwk"), dict) or "x" not in rv["publicJwk"]:
+        return "receiptVerifier.publicJwk.x is required"
+    if "evaluationId" not in body:
+        return "evaluationId is required"
     for d in body["dossiers"]:
         if not isinstance(d, dict) or "dossierId" not in d:
             return "Each dossier must have a dossierId"
-    rv = body.get("receiptVerifier", {})
-    if rv.get("algorithm") != "Ed25519":
-        return "receiptVerifier.algorithm must be Ed25519"
-    if "publicJwk" not in rv or "x" not in rv.get("publicJwk", {}):
-        return "receiptVerifier.publicJwk.x is required"
     return None
 
 
@@ -358,6 +354,10 @@ def get_or_compute_decisions(dossiers, batch_size=12, max_workers=6):
 def handle_propose(body):
     err = validate_propose_request(body)
     if err:
+        print(f"[PROPOSE 422] reason={err!r} "
+              f"top_level_keys={list(body.keys())} "
+              f"num_dossiers={len(body.get('dossiers', [])) if isinstance(body.get('dossiers'), list) else 'N/A'}",
+              flush=True)
         return jsonify({"error": err}), 422
 
     evaluation_id = body["evaluationId"]
@@ -476,6 +476,8 @@ def actions():
             return jsonify({"error": "operation must be 'propose' or 'commit'"}), 400
 
     except Exception as e:
+        import traceback
+        print(f"[INTERNAL ERROR] {e}\n{traceback.format_exc()}", flush=True)
         return jsonify({"error": f"Internal error: {e}"}), 400
 
 
