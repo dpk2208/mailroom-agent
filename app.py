@@ -160,13 +160,9 @@ def validate_propose_request(body):
         return "operation must be 'propose'"
     if not isinstance(body.get("dossiers"), list) or len(body["dossiers"]) == 0:
         return "dossiers must be a non-empty array"
-    seen_ids = set()
     for d in body["dossiers"]:
-        if "dossierId" not in d:
+        if not isinstance(d, dict) or "dossierId" not in d:
             return "Each dossier must have a dossierId"
-        if d["dossierId"] in seen_ids:
-            return f"Duplicate dossierId: {d['dossierId']}"
-        seen_ids.add(d["dossierId"])
     rv = body.get("receiptVerifier", {})
     if rv.get("algorithm") != "Ed25519":
         return "receiptVerifier.algorithm must be Ed25519"
@@ -312,18 +308,48 @@ def sanitize_decision(raw_decision, dossier, content_hash):
     }
 
 
-def get_or_compute_decision(dossier):
-    content_hash = compute_dossier_content_hash(dossier)
-    cache_key = f"decision:{content_hash}"
-    cached = redis_get(cache_key)
-    if cached is not None:
-        return cached
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    raw_list = call_llm_batch([dossier])
-    raw = raw_list[0] if raw_list else {}
-    decision = sanitize_decision(raw, dossier, content_hash)
-    redis_set(cache_key, decision)
-    return decision
+
+def get_or_compute_decisions(dossiers, batch_size=12, max_workers=6):
+    """Look up cached decisions by content hash; only call the model for
+    dossiers not already cached, batching several per call and running
+    batches concurrently to stay within the request/verification time
+    budget on a cold cache (e.g. 70 dossiers on the first-ever call)."""
+    decisions = {}
+    uncached = []
+
+    for dossier in dossiers:
+        content_hash = compute_dossier_content_hash(dossier)
+        cache_key = f"decision:{content_hash}"
+        cached = redis_get(cache_key)
+        if cached is not None:
+            decisions[dossier["dossierId"]] = cached
+        else:
+            uncached.append((dossier, content_hash, cache_key))
+
+    chunks = [uncached[i:i + batch_size] for i in range(0, len(uncached), batch_size)]
+
+    def process_chunk(chunk):
+        chunk_dossiers = [c[0] for c in chunk]
+        raw_list = call_llm_batch(chunk_dossiers)
+        raw_by_id = {r.get("dossierId"): r for r in raw_list if isinstance(r, dict)}
+        results = []
+        for dossier, content_hash, cache_key in chunk:
+            raw = raw_by_id.get(dossier["dossierId"], {})
+            decision = sanitize_decision(raw, dossier, content_hash)
+            results.append((cache_key, decision, dossier["dossierId"]))
+        return results
+
+    if chunks:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_chunk, c) for c in chunks]
+            for future in as_completed(futures):
+                for cache_key, decision, dossier_id in future.result():
+                    redis_set(cache_key, decision)
+                    decisions[dossier_id] = decision
+
+    return [decisions[d["dossierId"]] for d in dossiers]
 
 
 # ---------------------------------------------------------------------
@@ -348,10 +374,7 @@ def handle_propose(body):
         elif existing.get("inputDigest") != input_digest:
             return jsonify({"error": "evaluationId already used with different content"}), 409
 
-    proposals = []
-    for dossier in dossiers:
-        decision = get_or_compute_decision(dossier)
-        proposals.append(decision)
+    proposals = get_or_compute_decisions(dossiers)
 
     response_body = {
         "profile": PROFILE,
