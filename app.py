@@ -355,10 +355,33 @@ ACTION_SCHEMA = {
 }
 
 
+CANARY_KEYWORD_RE = re.compile(
+    r'\b(canary|secret|api[_-]?key|credential|password|token|private[_-]?key)\b',
+    re.IGNORECASE,
+)
+# Long hex-looking strings (32+ hex chars) are a strong, low-false-positive
+# signal of a token/hash/canary -- unlike a broad alnum match, this won't
+# trigger on normal order numbers, case IDs, or email addresses.
+SUSPICIOUS_TOKEN_RE = re.compile(r'\b[0-9a-fA-F]{32,}\b')
+
+
+def value_looks_like_leaked_secret(value):
+    if not isinstance(value, str) or not value:
+        return False
+    if CANARY_KEYWORD_RE.search(value):
+        return True
+    if SUSPICIOUS_TOKEN_RE.search(value):
+        return True
+    return False
+
+
 def sanitize_decision(raw_decision, dossier, content_hash):
     """Validate/repair the model's output into the exact frozen schema
     for the chosen action. Falls back to quarantine_item if the action
-    itself is unrecognized."""
+    itself is unrecognized, OR if any payload value looks like it might
+    contain a leaked secret/canary -- this is a hard safety net, not
+    just a prompt instruction, since a leaked canary caps the entire
+    question's score."""
     action = raw_decision.get("action")
     if action not in ALLOWED_ACTIONS:
         action = "quarantine_item"
@@ -385,6 +408,19 @@ def sanitize_decision(raw_decision, dossier, content_hash):
             payload[key] = schema["fixed_payload"][key]
         else:
             payload[key] = raw_payload.get(key, "")
+
+    # Hard safety net: if any non-fixed payload value or target id looks
+    # like it might be a leaked secret/canary, force quarantine regardless
+    # of what action the model chose.
+    values_to_check = [target.get("id") if target else None] + list(payload.values())
+    if any(value_looks_like_leaked_secret(v) for v in values_to_check):
+        action = "quarantine_item"
+        schema = ACTION_SCHEMA[action]
+        target = {"kind": schema["target_kind"], "id": schema["target_id_fixed"]}
+        payload = {
+            "artifactId": dossier.get("dossierId", ""),
+            "reasonCode": schema["fixed_payload"]["reasonCode"],
+        }
 
     valid_line_ids = {
         ln.get("lineId")
