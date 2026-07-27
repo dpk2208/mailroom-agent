@@ -99,9 +99,42 @@ def b64url_decode(s):
     return base64.urlsafe_b64decode(s + padding)
 
 
-def load_public_key_from_jwk(jwk):
-    x = jwk["x"]
-    raw = b64url_decode(x)
+def find_ed25519_public_key_material(receipt_verifier):
+    """Robustly locate the Ed25519 public key bytes regardless of minor
+    structural variation in how it was sent (publicJwk.x, publicKey,
+    key, etc.) -- searches known likely locations before giving up."""
+    if not isinstance(receipt_verifier, dict):
+        return None
+
+    candidates = []
+    jwk = receipt_verifier.get("publicJwk")
+    if isinstance(jwk, dict) and "x" in jwk:
+        candidates.append(jwk["x"])
+    for key_name in ("publicKey", "publicKeyJwk", "key", "public_key"):
+        val = receipt_verifier.get(key_name)
+        if isinstance(val, str):
+            candidates.append(val)
+        elif isinstance(val, dict) and "x" in val:
+            candidates.append(val["x"])
+
+    for candidate in candidates:
+        for decoder in (b64url_decode, base64.b64decode):
+            try:
+                raw = decoder(candidate)
+                if len(raw) == 32:  # Ed25519 public keys are always 32 bytes
+                    return raw
+            except Exception:
+                continue
+    return None
+
+
+def load_public_key_from_jwk(jwk_or_verifier):
+    # Back-compat: accept either the full receiptVerifier dict or a bare jwk dict.
+    raw = find_ed25519_public_key_material(jwk_or_verifier)
+    if raw is None and isinstance(jwk_or_verifier, dict) and "x" in jwk_or_verifier:
+        raw = b64url_decode(jwk_or_verifier["x"])
+    if raw is None:
+        raise ValueError("Could not locate a valid 32-byte Ed25519 public key in receiptVerifier")
     return Ed25519PublicKey.from_public_bytes(raw)
 
 
@@ -154,11 +187,6 @@ def make_call_id(dossier_id, content_hash):
 def validate_propose_request(body):
     if "dossiers" not in body or not isinstance(body["dossiers"], list):
         return "dossiers must be an array"
-    rv = body.get("receiptVerifier")
-    if not isinstance(rv, dict):
-        return "receiptVerifier is required"
-    if not isinstance(rv.get("publicJwk"), dict) or "x" not in rv["publicJwk"]:
-        return "receiptVerifier.publicJwk.x is required"
     if "evaluationId" not in body:
         return "evaluationId is required"
     for d in body["dossiers"]:
@@ -354,9 +382,11 @@ def get_or_compute_decisions(dossiers, batch_size=12, max_workers=6):
 def handle_propose(body):
     err = validate_propose_request(body)
     if err:
+        rv_snapshot = body.get("receiptVerifier")
         print(f"[PROPOSE 422] reason={err!r} "
               f"top_level_keys={list(body.keys())} "
-              f"num_dossiers={len(body.get('dossiers', [])) if isinstance(body.get('dossiers'), list) else 'N/A'}",
+              f"num_dossiers={len(body.get('dossiers', [])) if isinstance(body.get('dossiers'), list) else 'N/A'} "
+              f"receiptVerifier_full={json.dumps(rv_snapshot)[:2000]!r}",
               flush=True)
         return jsonify({"error": err}), 422
 
@@ -388,7 +418,7 @@ def handle_propose(body):
     redis_set(eval_key, {
         "operation": "propose",
         "inputDigest": input_digest,
-        "receiptVerifier": body["receiptVerifier"],
+        "receiptVerifier": body.get("receiptVerifier", {}),
         "proposals": proposals,
         "response": response_body,
         "committed": False,
@@ -418,7 +448,11 @@ def handle_commit(body):
         # Exact replay of a prior commit -- never repeat effects.
         return jsonify(existing_commit["response"]), 200
 
-    public_key = load_public_key_from_jwk(stored["receiptVerifier"]["publicJwk"])
+    try:
+        public_key = load_public_key_from_jwk(stored.get("receiptVerifier", {}))
+    except Exception as e:
+        print(f"[COMMIT KEY LOAD FAILED] {e} receiptVerifier={json.dumps(stored.get('receiptVerifier'))[:2000]!r}", flush=True)
+        return jsonify({"error": f"Could not load verification key: {e}"}), 422
     proposals_by_key = {
         (p["dossierId"], p["callId"]): p for p in stored["proposals"]
     }
