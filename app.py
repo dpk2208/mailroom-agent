@@ -423,7 +423,7 @@ def get_or_compute_decisions(dossiers, batch_size=12, max_workers=6):
 
     for dossier in dossiers:
         content_hash = compute_dossier_content_hash(dossier)
-        cache_key = f"decision:{content_hash}"
+        cache_key = f"decision:v2:{content_hash}"
         cached = redis_get(cache_key)
         if cached is not None:
             decisions[dossier["dossierId"]] = cached
@@ -472,7 +472,7 @@ def handle_propose(body):
     dossiers = body["dossiers"]
     input_digest = compute_input_digest(dossiers)
 
-    eval_key = f"eval:{evaluation_id}"
+    eval_key = f"eval:v2:{evaluation_id}"
     existing = redis_get(eval_key)
 
     if existing is not None:
@@ -511,7 +511,7 @@ def handle_commit(body):
         return jsonify({"error": err}), 422
 
     evaluation_id = body["evaluationId"]
-    eval_key = f"eval:{evaluation_id}"
+    eval_key = f"eval:v2:{evaluation_id}"
     stored = redis_get(eval_key)
 
     if stored is None:
@@ -520,7 +520,7 @@ def handle_commit(body):
     if body["inputDigest"] != stored["inputDigest"]:
         return jsonify({"error": "inputDigest mismatch for this evaluationId"}), 409
 
-    commit_key = f"commit:{evaluation_id}"
+    commit_key = f"commit:v2:{evaluation_id}"
     existing_commit = redis_get(commit_key)
     if existing_commit is not None:
         # Exact replay of a prior commit -- never repeat effects.
